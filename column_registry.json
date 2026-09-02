@@ -1,0 +1,34 @@
+{
+  "columns": {
+    "accounting_site_code_post_acc": {
+      "source_table": "FEM",
+      "data_type": "string",
+      "description": "Accounting site code (post accretion) — used by scopes: us, fortis, japan",
+      "nullable": false,
+      "sample_values": ["12309", "40043", "10276", "30448"]
+    },
+
+    "pmas_code_post_acc": {
+      "source_table": "FEM",
+      "data_type": "string",
+      "description": "PMA code (post accretion) — used by scopes: bcef, japan",
+      "nullable": true,
+      "sample_values": ["PMA_03", "PMA_05"]
+    },
+
+    "lb_site_risque_apres_accr": {
+      "source_table": "FEM",
+      "data_type": "string",
+      "description": "Site risque label (post accretion) — used by scope: bcef",
+      "nullable": true,
+      "sample_values": ["BNPP Factor France", "BNPP Fortis"]
+    }
+  },
+
+  "operators": {
+    "EQUALS": {"description": "Exact match", "supported_types": ["string", "integer", "float"], "requires_array": false},
+    "NOT_EQUALS": {"description": "Not equal", "supported_types": ["string", "integer", "float"], "requires_array": false},
+    "IN": {"description": "Value in list", "supported_types": ["string", "integer"], "requires_array": true},
+    "NOT_IN": {"description": "Value not in list", "supported_types": ["string", "integer"], "requires_array": true, "supports_null": true}
+  }
+}
