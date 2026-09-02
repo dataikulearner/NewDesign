@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import logging
 from typing import Optional, List, Dict, Any
 
@@ -11,6 +12,19 @@ from generics.registries.scope_registry import ScopeRegistry
 
 logger = logging.getLogger(__name__)
 
+#: Keys in DSS custom variables that are STRING-ENCODED Python literals
+#: (list/dict) and must go through ast.literal_eval() — confirmed from
+#: the real compute_SP_agg recipe (DETECT_CCIRC_PROD). Any key NOT in
+#: this set is used as-is (already a plain string in dss_vars, e.g.
+#: axes_str, pma_col, entity_title...).
+DSS_VARS_LITERAL_KEYS = [
+    "target_variables",
+    "line_id_cols",
+    "target_agg_functions",
+    "segment_vars",
+    "weight_vars",
+]
+
 
 class GenericPipeline:
     """
@@ -20,11 +34,13 @@ class GenericPipeline:
         >>> pipeline = GenericPipeline(spark_sess, config_root="config")
         >>> df_agg = pipeline.run_pre_processing(
         ...     flow_type="ccirc",
-        ...     axes_str_par="entity___accounting_site_code_post_acc",  # from axes_periods_par dataset
+        ...     axes_str_par="entity___accounting_site_code_post_acc",
         ...     table_path="hdfs://.../FEM.orc", period="2026Q1",
         ...     period_run="2026Q1", scope_run="risk_corp", id_set_params="v1",
-        ...     scope="risk_corp",
         ... )
+        >>> # ... modeling stage in between ...
+        >>> df_final = pipeline.run_post_processing(df_final, flow_type="ccirc")
+        >>> # df_final now has a "perimeters_list" column, SAME row count
     """
 
     def __init__(
@@ -33,7 +49,7 @@ class GenericPipeline:
         config_root: str = "config",
         prepare_agg_period_axe_func=None,
         generate_business_axes_func=None,
-        compute_scope_func=None,
+        add_perimeters_list_func=None,
         period_const: str = None,
         table_path_const: str = None,
     ):
@@ -48,12 +64,11 @@ class GenericPipeline:
             generate_business_axes_func: Injectable legacy
                 utils.py.generate_business_axes (testing). Defaults to
                 lazy import in production.
-            compute_scope_func: Injectable utils.py compute_scope
-                (testing). Defaults to lazy import in production.
+            add_perimeters_list_func: Injectable legacy
+                utils.scopes.add_perimeters_list (testing). Defaults to
+                lazy import in production.
             period_const, table_path_const: Injectable values for
-                core.constants.PERIOD / TABLE_PATH (testing — these are
-                literal column-name strings, e.g. "period"/"table_path").
-                Defaults to lazy import in production.
+                core.constants.PERIOD / TABLE_PATH (testing).
         """
         self.spark = spark_sess
         self.config_root = config_root
@@ -62,7 +77,7 @@ class GenericPipeline:
         )
         self._prepare_agg_period_axe = prepare_agg_period_axe_func
         self._generate_business_axes = generate_business_axes_func
-        self._compute_scope = compute_scope_func
+        self._add_perimeters_list = add_perimeters_list_func
         self._period_const = period_const
         self._table_path_const = table_path_const
 
@@ -75,8 +90,45 @@ class GenericPipeline:
         path = f"{self.config_root}/flows/{flow_type}_params.json"
         return load_and_validate_params(path)
 
+    @staticmethod
+    def params_from_dss_vars(dss_vars: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert DSS Project Variables (dataiku.get_custom_variables())
+        into the clean params dict GenericPipeline methods expect.
+
+        DSS custom variables are a flat dict where list/dict-typed
+        values are STRING-ENCODED (Python literal syntax) — the real
+        recipe parses them with ast.literal_eval() before use. This
+        does the same, only for the confirmed keys (DSS_VARS_LITERAL_KEYS).
+        All other keys (axes_str, pma_col, pma_mapping_col,
+        pma_mapping_path, entity_mapping_col, entity_title, flow_type,
+        scopes if present...) are passed through as-is.
+
+        NOTE: unlike load_and_validate_params() (file-based path), this
+        does NOT enforce source_tables/detector as required — those are
+        not consumed by any code yet (see params_loader.REQUIRED_KEYS
+        note). Only "flow_type" matters, and it's used as-is (no key
+        renaming needed — ScopeRegistry reads "flow_type" directly).
+
+        Args:
+            dss_vars: dict from dataiku.get_custom_variables()
+
+        Returns:
+            Params dict, ready to pass as `params=` to run_pre_processing()
+        """
+        params = dict(dss_vars)  # shallow copy, don't mutate caller's dict
+
+        for key in DSS_VARS_LITERAL_KEYS:
+            if key in params and isinstance(params[key], str):
+                params[key] = ast.literal_eval(params[key])
+
+        if "scopes" in params and isinstance(params["scopes"], str):
+            params["scopes"] = ast.literal_eval(params["scopes"])
+
+        return params
+
     # -------------------------------------------------------------------------
-    # RELEVANT COLS — matches real recipe formula exactly
+    # RELEVANT COLS
     # -------------------------------------------------------------------------
 
     def _build_relevant_cols(self, flow_type: str, params: Dict[str, Any]) -> List[str]:
@@ -84,26 +136,12 @@ class GenericPipeline:
         relevant_cols = id_cols + target_vars + business_axes
                          + [PERIOD, TABLE_PATH] + column_registry.get_for_flow(flow_type)
 
-        Base formula matches compute_SP_agg (DETECT_CCIRC_PROD) exactly
-        — see module docstring point 2. ColumnRegistry's columns are
-        ADDED ON TOP (additive, not a replacement of the base formula).
-
-        WHY THIS ACHIEVES GENERICITY WITHOUT TOUCHING LEGACY:
-        Inside enrich_data_period_ccirc (frozen, legacy), the final
-        column selection does:
-            for scope_col in SCOPE_SOURCE_COLMNS:   # hardcoded list
-                if scope_col not in relevant_cols and scope_col in df.columns:
-                    relevant_cols.append(scope_col)
-        This is APPEND-ONLY — it only adds columns MISSING from the
-        `relevant_cols` we pass in, never removes any. So if we already
-        include a new scope column here (via ColumnRegistry, itself
-        driven by column_registry.json — one file per flow's project),
-        that column reaches enrich_data_period_ccirc ALREADY present,
-        and the hardcoded SCOPE_SOURCE_COLMNS loop simply skips it
-        (condition `not in relevant_cols` is False) — a no-op, not a
-        conflict. Legacy code is not modified, not even touched at
-        runtime for that column. Adding a new scope-filter column
-        therefore requires editing ONLY column_registry.json.
+        Base formula matches compute_SP_agg (DETECT_CCIRC_PROD) exactly.
+        ColumnRegistry's columns are ADDED ON TOP (additive) — see
+        ARCHITECTURE_GENERICS_FR_V2.md for why this achieves genericity
+        without ever touching enrich_data_period_ccirc.py (its own
+        SCOPE_SOURCE_COLMNS append loop is append-only, so a column we
+        already supplied is simply skipped there, not conflicted with).
         """
         id_cols = params["line_id_cols"]
         target_vars = params["target_variables"]
@@ -116,7 +154,6 @@ class GenericPipeline:
 
         registry_cols = self.column_registry.get_for_flow(flow_type)
 
-        # Preserve order for the base formula, dedup across all sources
         seen = set()
         relevant_cols = []
         for col in (
@@ -130,7 +167,7 @@ class GenericPipeline:
         return relevant_cols
 
     # -------------------------------------------------------------------------
-    # STAGE: PRE-PROCESSING (enrich + aggregate + scope filter)
+    # STAGE 1+2: PRE-PROCESSING (enrich + aggregate)
     # -------------------------------------------------------------------------
 
     def run_pre_processing(
@@ -142,41 +179,43 @@ class GenericPipeline:
         period_run: str,
         scope_run: str,
         id_set_params: str,
-        scope: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
         """
-        Run Stage 1+2: enrich (legacy) + aggregate (legacy) + scope
-        filter (legacy utils.py, if this flow has scopes).
+        Run Stage 1+2: enrich (legacy) + aggregate (legacy).
+
+        NOTE: no scope filtering happens here (v3 correction) — scope
+        labeling (add_perimeters_list) happens in run_post_processing()
+        instead, and does not remove any row. This stage still runs
+        ScopeRegistry.validate_and_fail_fast() when the flow has scopes
+        declared — config validation is independent of where the
+        labeling itself happens, and must fail fast, before Spark work.
 
         Args:
             flow_type: e.g. "ccirc"
             axes_str_par: The SPECIFIC axis combination for this
-                partition (e.g. "entity___stage") — comes from the
-                upstream "axes_periods_par" dataset in the real DSS
-                recipe, NOT from params["axes_str"] (which is only
-                used to compute business_axes for relevant_cols).
+                partition (from the upstream "axes_periods_par" dataset
+                in the real DSS recipe) — NOT params["axes_str"].
             table_path: HDFS path to the source table (FEM)
             period: Period being enriched (e.g. "2026Q1")
             period_run: Running period for partitioning
-            scope_run: Running scope label (legacy tag)
+            scope_run: Running scope label (legacy tag, unrelated to
+                row filtering — see module docstring)
             id_set_params: Running parameter-set id
-            scope: Scope id to filter by. None = no filtering.
+            params: Pre-loaded params dict (e.g. from
+                GenericPipeline.params_from_dss_vars(dss_vars)). If
+                None (default), params are loaded from
+                config_root/flows/<flow_type>_params.json instead.
 
         Returns:
-            Aggregated (and, if requested, scope-filtered) DataFrame
+            Aggregated DataFrame (same row semantics as legacy output)
         """
-        params = self._load_params(flow_type)
+        if params is None:
+            params = self._load_params(flow_type)
 
-        scope_registry = None
         if params.get("scopes"):
             scope_registry = ScopeRegistry(params, self.column_registry)
             scope_registry.validate_and_fail_fast()
-        elif scope:
-            logger.warning(
-                f"[GenericPipeline] scope='{scope}' requested but flow "
-                f"'{flow_type}' has no 'scopes' declared in its params — ignored"
-            )
-            scope = None
 
         relevant_cols = self._build_relevant_cols(flow_type, params)
 
@@ -208,17 +247,48 @@ class GenericPipeline:
             relevant_cols=relevant_cols,
         )
 
-        if scope:
-            compute_scope = self._resolve_compute_scope()
-            logger.info(f"[GenericPipeline] Applying scope filter: '{scope}'")
-            mask = compute_scope(df_agg, scope, params["scopes"][scope]["filters"])
-            rows_before = len(df_agg)
-            df_agg = df_agg[mask]
-            logger.info(
-                f"[GenericPipeline] Scope '{scope}': {rows_before} -> {len(df_agg)} rows"
-            )
-
         return df_agg
+
+    # -------------------------------------------------------------------------
+    # STAGE 5: POST-PROCESSING (scope labeling — perimeters_list)
+    # -------------------------------------------------------------------------
+
+    def run_post_processing(
+        self,
+        df: pd.DataFrame,
+        flow_type: str,
+    ) -> pd.DataFrame:
+        """
+        Run the scope-labeling step: adds a "perimeters_list" column
+        (legacy utils.scopes.add_perimeters_list), called directly,
+        never re-implemented.
+
+        Does NOT filter any row — row count in == row count out.
+        If this flow has no "scopes" declared (e.g. IFRS9),
+        add_perimeters_list itself returns a DataFrame with
+        perimeters_list = NaN for every row (legacy behavior,
+        unchanged here).
+
+        Args:
+            df: DataFrame to label (post-modeling / post-detection)
+            flow_type: e.g. "ccirc"
+
+        Returns:
+            Same DataFrame with a "perimeters_list" column added,
+            no scope_* intermediate columns, same row count.
+        """
+        params = self._load_params(flow_type)
+        add_perimeters_list = self._resolve_add_perimeters_list()
+
+        rows_before = len(df)
+        result = add_perimeters_list(df, params.get("scopes"), flow_type)
+
+        logger.info(
+            f"[GenericPipeline] run_post_processing: {rows_before} -> "
+            f"{len(result)} rows (must be unchanged)"
+        )
+
+        return result
 
     # -------------------------------------------------------------------------
     # INJECTABLE RESOLUTION (lazy import in production, injectable in tests)
@@ -236,11 +306,11 @@ class GenericPipeline:
         from utils.py import generate_business_axes
         return generate_business_axes
 
-    def _resolve_compute_scope(self):
-        if self._compute_scope is not None:
-            return self._compute_scope
-        from utils.py import compute_scope
-        return compute_scope
+    def _resolve_add_perimeters_list(self):
+        if self._add_perimeters_list is not None:
+            return self._add_perimeters_list
+        from utils.scopes import add_perimeters_list
+        return add_perimeters_list
 
     def _resolve_constants(self):
         if self._period_const is not None and self._table_path_const is not None:
