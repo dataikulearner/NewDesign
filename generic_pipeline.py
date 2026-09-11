@@ -1,6 +1,12 @@
+"""
+GenericPipeline — orchestrator 
+
+"""
+
 from __future__ import annotations
 
 import ast
+import json
 import logging
 from typing import Optional, List, Dict, Any
 
@@ -47,37 +53,23 @@ class GenericPipeline:
         self,
         spark_sess,
         config_root: str = "config",
+        folder_id: Optional[str] = None,
         prepare_agg_period_axe_func=None,
         generate_business_axes_func=None,
         add_perimeters_list_func=None,
+        strategy_factory=None,
         period_const: str = None,
         table_path_const: str = None,
+        column_registry: Optional[ColumnRegistry] = None,
     ):
-        """
-        Args:
-            spark_sess: SparkSession
-            config_root: Root folder containing column_registry.json and
-                flows/<flow_type>_params.json
-            prepare_agg_period_axe_func: Injectable legacy
-                core.pre_processing.prepare_agg_period_axe (testing).
-                Defaults to lazy import in production.
-            generate_business_axes_func: Injectable legacy
-                utils.py.generate_business_axes (testing). Defaults to
-                lazy import in production.
-            add_perimeters_list_func: Injectable legacy
-                utils.scopes.add_perimeters_list (testing). Defaults to
-                lazy import in production.
-            period_const, table_path_const: Injectable values for
-                core.constants.PERIOD / TABLE_PATH (testing).
-        """
         self.spark = spark_sess
         self.config_root = config_root
-        self.column_registry = ColumnRegistry.load_from_file(
-            f"{config_root}/column_registry.json"
-        )
+        self.folder_id = folder_id
+        self._column_registry = column_registry  # lazy — see property below
         self._prepare_agg_period_axe = prepare_agg_period_axe_func
         self._generate_business_axes = generate_business_axes_func
         self._add_perimeters_list = add_perimeters_list_func
+        self._strategy_factory = strategy_factory
         self._period_const = period_const
         self._table_path_const = table_path_const
 
@@ -85,10 +77,67 @@ class GenericPipeline:
     # PARAMS LOADING
     # -------------------------------------------------------------------------
 
+    @property
+    def column_registry(self) -> ColumnRegistry:
+        """
+        Lazily load ColumnRegistry on first access.
+
+        Only run_pre_processing() (via _build_relevant_cols() and
+        ScopeRegistry validation) ever touches this — run_modeling()
+        and run_post_processing() never do. Loading eagerly in
+        __init__ forced every caller (even a recipe that only calls
+        run_modeling()) to have a valid config_root/folder_id, even
+        though most of them never needed it. Lazy loading means a
+        modeling-only or post-processing-only pipeline instance can
+        be built with no folder_id/config_root at all.
+
+        Raises:
+            RegistryError: If accessed without config_root/folder_id
+                having been set to something loadable (surfaces at the
+                point of actual use — run_pre_processing() — not at
+                construction time).
+        """
+        if self._column_registry is None:
+            if self.folder_id is not None:
+                ColumnRegistry.reset()
+                self._column_registry = ColumnRegistry.load(self.folder_id, "column_registry.json")
+            else:
+                self._column_registry = ColumnRegistry.load_from_file(
+                    f"{self.config_root}/column_registry.json"
+                )
+        return self._column_registry
+
     def _load_params(self, flow_type: str) -> Dict[str, Any]:
         """Load and validate this flow's own params file."""
         path = f"{self.config_root}/flows/{flow_type}_params.json"
         return load_and_validate_params(path)
+
+    @staticmethod
+    def _parse_literal(value: str) -> Any:
+        """
+        Parse a string-encoded list/dict DSS variable robustly.
+
+        Tries json.loads() FIRST — DSS Project Variables are commonly
+        serialized via json.dumps() (INIT flow's
+        save_parameters_to_project_variables), which produces JSON
+        syntax: true/false/null (lowercase). ast.literal_eval() only
+        understands Python syntax (True/False/None) and raises
+        "malformed node or string" (an ast.Name — a bare identifier —
+        for the unrecognized true/false/null token) on genuine JSON
+        booleans/nulls — confirmed via a real failure: ccirc_params.json's
+        "scopes"."bcef" filter has "allow_null": true, which broke
+        ast.literal_eval() when scopes was parsed this way.
+
+        Falls back to ast.literal_eval() for values that aren't valid
+        JSON but are valid Python literals (e.g. single-quoted strings
+        inside the encoded value, or a Python-style dict/list some
+        other caller produced) — covers both encodings without
+        guessing which one was actually used to write to dss_vars.
+        """
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return ast.literal_eval(value)
 
     @staticmethod
     def params_from_dss_vars(dss_vars: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,12 +146,15 @@ class GenericPipeline:
         into the clean params dict GenericPipeline methods expect.
 
         DSS custom variables are a flat dict where list/dict-typed
-        values are STRING-ENCODED (Python literal syntax) — the real
-        recipe parses them with ast.literal_eval() before use. This
-        does the same, only for the confirmed keys (DSS_VARS_LITERAL_KEYS).
+        values are STRING-ENCODED — the real recipe parses the simple
+        ones (target_variables, line_id_cols...) with ast.literal_eval().
+        This uses _parse_literal() instead (json.loads() first, falling
+        back to ast.literal_eval()) for robustness — see _parse_literal
+        docstring for why plain ast.literal_eval() is not safe for every
+        key (breaks on JSON-style true/false/null, e.g. inside "scopes").
         All other keys (axes_str, pma_col, pma_mapping_col,
-        pma_mapping_path, entity_mapping_col, entity_title, flow_type,
-        scopes if present...) are passed through as-is.
+        pma_mapping_path, entity_mapping_col, entity_title, flow_type...)
+        are passed through as-is.
 
         NOTE: unlike load_and_validate_params() (file-based path), this
         does NOT enforce source_tables/detector as required — those are
@@ -120,10 +172,10 @@ class GenericPipeline:
 
         for key in DSS_VARS_LITERAL_KEYS:
             if key in params and isinstance(params[key], str):
-                params[key] = ast.literal_eval(params[key])
+                params[key] = GenericPipeline._parse_literal(params[key])
 
         if "scopes" in params and isinstance(params["scopes"], str):
-            params["scopes"] = ast.literal_eval(params["scopes"])
+            params["scopes"] = GenericPipeline._parse_literal(params["scopes"])
 
         return params
 
@@ -250,6 +302,72 @@ class GenericPipeline:
         return df_agg
 
     # -------------------------------------------------------------------------
+    # STAGE 4: MODELING (anomaly detection)
+    # -------------------------------------------------------------------------
+
+    def run_modeling(
+        self,
+        df: pd.DataFrame,
+        params: Optional[Dict[str, Any]] = None,
+        flow_type: Optional[str] = None,
+        detector_name: str = "statistical",
+    ) -> pd.DataFrame:
+        """
+        Run Stage 4: anomaly detection, via StrategyFactory.
+
+        Confirmed against the real compute_SP_anomalies recipe
+        (DETECT_CCIRC_DEV): calls detect_axes ONCE, with 8 params from
+        ccirc_params.json (thresholds_segment_anomaly,
+        thresholds_negligibility, target_detection_mapping,
+        seg_agg_materiality, nb_periods, nb_last, s_window, nbs_last).
+        detect_axes itself takes NO flow_type argument at all.
+
+        NOTE on input `df`: the real recipe passes SP_agg_focus_model,
+        NOT the raw SP_agg output of run_pre_processing() directly —
+        there is an intermediate compute_SP_agg_focus_model step (not
+        yet reviewed/wrapped here) between pre-processing and modeling.
+        Callers must supply whatever DataFrame that step produces.
+
+        Args:
+            df: Input DataFrame (SP_agg_focus_model in the real flow)
+            params: Pre-loaded params dict (e.g. from
+                params_from_dss_vars(dss_vars)) — the standard real
+                usage. When given, `flow_type` is NOT required — it's
+                derived from params["flow_type"] (only used for
+                logging; detect_axes never receives it).
+            flow_type: Only required when `params` is None — used to
+                load config_root/flows/<flow_type>_params.json. If
+                `params` is already provided, this is optional and
+                purely cosmetic (overrides the logged flow name).
+            detector_name: Which registered detector strategy to use.
+                Defaults to "statistical" (StatisticalDetector).
+
+        Returns:
+            DataFrame with detection results (anomaly, deviation, ...)
+            for every target variable / axes combination present in df.
+
+        Raises:
+            ValueError: If both params and flow_type are None (nothing
+                to load params from, nothing to log either).
+        """
+        if params is None:
+            if flow_type is None:
+                raise ValueError(
+                    "[GenericPipeline] run_modeling: either params= or "
+                    "flow_type= must be provided (flow_type is needed "
+                    "to load config_root/flows/<flow_type>_params.json)"
+                )
+            params = self._load_params(flow_type)
+        else:
+            flow_type = flow_type or params.get("flow_type", "unknown")
+
+        detector = self._resolve_strategy_factory().get_detector(detector_name)
+
+        logger.info(f"[GenericPipeline] Stage 4: modeling flow='{flow_type}' detector='{detector_name}'")
+
+        return detector.detect(df, params)
+
+    # -------------------------------------------------------------------------
     # STAGE 5: POST-PROCESSING (scope labeling — perimeters_list)
     # -------------------------------------------------------------------------
 
@@ -311,6 +429,12 @@ class GenericPipeline:
             return self._add_perimeters_list
         from utils.scopes import add_perimeters_list
         return add_perimeters_list
+
+    def _resolve_strategy_factory(self):
+        if self._strategy_factory is not None:
+            return self._strategy_factory
+        from generics.strategies.factory import StrategyFactory
+        return StrategyFactory
 
     def _resolve_constants(self):
         if self._period_const is not None and self._table_path_const is not None:
