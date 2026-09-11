@@ -1,7 +1,34 @@
 """
 Concrete Detector Strategy.
+
+The only surviving Strategy in the v3.3 architecture — PreProcessorStrategy
+and PostProcessorStrategy were removed entirely because legacy code
+already does that work. Detection is the one place a thin abstraction
+still earns its keep: it lets StatisticalDetector be swapped for an
+MLDetector later without touching GenericPipeline.
+
+CORRECTED (v3.3): the previous signature was FABRICATED (never
+verified against real code). Confirmed against the real
+compute_SP_anomalies recipe (screenshots, DETECT_CCIRC_DEV):
+
+    from core.models import detect_axes
+    df_out = detect_axes(
+        SP_agg_focus_model_df, thresholds_segment_anomaly,
+        thresholds_negligibility, target_detection_mapping,
+        seg_agg_materiality, nb_periods, nb_last, s_window, nbs_last,
+    )
+
+All 8 param keys confirmed present in the real ccirc_params.json.
+Note: `segment_vars`, `weight_vars`, `materiality_metric` are loaded
+by the real recipe (DSS variables) but NOT passed into this specific
+detect_axes call — they are not part of this function's contract, so
+StatisticalDetector does not require them either.
+
 Classes:
     StatisticalDetector: thin wrapper around core.models.detect_axes
+
+Author: PROMETHEE Team
+Date: September 2026
 """
 
 from __future__ import annotations
@@ -112,6 +139,21 @@ class StatisticalDetector(DetectorStrategy):
             f"[{self.name}] Calling detect_axes once on {len(df)} rows "
             f"(nb_periods={params['nb_periods']}, nb_last={params['nb_last']})"
         )
+
+        # DIAGNOSTIC (temporary — helps pinpoint dtype mismatches that
+        # surface as "can only concatenate str (not 'int') to str" deep
+        # inside legacy detect_axes, e.g. an axis column coming through
+        # as int64 instead of object/string). Logs every column's dtype
+        # plus a few sample values for columns that look like axis/scope
+        # columns (name contains "site_code", "entity", "axe", "scope").
+        logger.info(f"[{self.name}] df dtypes:\n{df.dtypes.to_string()}")
+        suspect_cols = [
+            c for c in df.columns
+            if any(kw in c.lower() for kw in ("site_code", "entity", "axe", "scope", "accounting"))
+        ]
+        for col in suspect_cols:
+            sample = df[col].dropna().head(3).tolist()
+            logger.info(f"[{self.name}] column '{col}' dtype={df[col].dtype} sample={sample}")
 
         result = detect_axes(
             df,
